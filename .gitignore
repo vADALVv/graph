@@ -1,29 +1,81 @@
 # ============================================================
-# Трекаем только src/ и data/, остальное игнорируем
+# Игнорируем всё в корне, но сохраняем src/ и data/
 # ============================================================
 
-# 1) Игнорировать всё в корне репозитория
+# 1) Игнорировать всё в корне репозитория...
 /*
 
-# 2) ...кроме исходников, данных и служебных файлов
+# 2) ...кроме папок с кодом и данными
 !/src/
 !/data/
 !/.gitignore
 !/README.md
+!/LICENSE
 
-# 3) Внутри src/ и data/ не тащим в гит генерируемое/служебное
-__pycache__/
-*.py[cod]
-.ipynb_checkpoints/
+# 3) Исключения ВНУТРИ src/ (что НЕ пушить)
+# -----------------------------------------
 
-# результаты прогонов и кэши (создаются внутри src при запуске)
-src/results/
-src/results_2/
-src/**/llm_cache.json
-src/*.html
+# 🔥 СЕКРЕТЫ: config.py с реальными ключами НЕ пушим
+/src/config.py
+!/src/config.example.py
 
-# системное / IDE
+# Результаты экспериментов (большие, генерируемые)
+/src/results/
+/src/results_2/
+/src/results_*/
+/src/experiment_*/
+
+# Кэш LLM (может содержать sensitive данные)
+/src/llm_cache.json
+/src/*/llm_cache.json
+/src/*.cache
+
+# Временные файлы Python
+/src/__pycache__/
+/src/*.pyc
+/src/*.pyo
+/src/*.pyd
+/src/*.so
+/src/*.dylib
+/src/*.dll
+
+# Jupyter notebooks (если есть)
+/src/.ipynb_checkpoints/
+/src/*.ipynb
+
+# HTML отчеты (генерируемые)
+/src/*.html
+/src/*.htm
+
+# Логи
+/src/*.log
+/src/logs/
+
+# 4) Системные файлы (игнорируем везде)
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+
+# 5) Файлы окружения
+.env
+.env.local
+.env.*.local
+
+# 6) Данные (если лежат в корне)
+/data/raw/
+/data/processed/
+/data/interim/
+/data/external/
+*.db
+*.sqlite
+
+# 7) Документация и отчеты (генерируемые)
+/docs/_build/
+/docs/build/
+/reports/

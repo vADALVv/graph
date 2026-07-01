@@ -1,416 +1,397 @@
-# run_2.py
-import json
+# run_2.py — эксперимент: зависимость распространения вредного контента
+# от числа красных узлов (R). Усреднение по нескольким прогонам с РАЗНЫМИ сидами.
+# L-узлы генерируют реальной LLM (GigaChat) — доступ настроен через config.py.
 import os
-import random
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import defaultdict
+import csv
+import json
 from datetime import datetime
+
+import numpy as np
+import matplotlib
+# headless-safe: на сервере без дисплея используем неинтерактивный бэкенд
+if os.name != "nt" and not os.environ.get("DISPLAY"):
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from graph_structure import create_graph
-from simulation import simulate_diffusion
-from blue_agent import BlueAgent
-from scipy.stats import pearsonr
-import time
+from simulation import simulate_diffusion, RepostParams
+
+# --- Ключи и выбор моделей из общего config.py ---
+from config import (
+    GIGACHAT_AUTH_KEY, GIGACHAT_SCOPE,
+    YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_IAM_TOKEN, HF_TOKEN,
+    LLM_MODEL_TYPE, BLUE_MODEL_TYPE, BLUE_MODEL_DIR,
+)
 
 # ============================================================
-# КОНСТАНТНЫЕ ПАРАМЕТРЫ
+# ПАРАМЕТРЫ ЭКСПЕРИМЕНТА
 # ============================================================
-N_USERS = 120              # Количество обычных пользователей
-N_RED_VALUES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 25, 30]  # Количество красных узлов
-N_LLM = 2                 # Количество LLM-агентов
-N_BLUE = 7                # Количество синих (модераторов)
-AVG_DEGREE = 5            # Средняя степень графа
-T_STEPS = 20              # Количество временных шагов
-N_RUNS = 1               # Количество запусков для каждого значения (для усреднения)
+N_USERS = 100
+N_RED_VALUES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 25, 30]
+N_LLM = 5
+N_BLUE = 11               # синий-наблюдатель не влияет на заражение; выключен (быстрее)
+AVG_DEGREE = 5
+T_STEPS = 20
+N_RUNS = 5                # прогонов на точку (усреднение по сидам)
+BASE_SEED = 1000          # базовый сид; на каждый прогон свой сид
 
-# ИСПРАВЛЕННЫЙ ПУТЬ К ФАЙЛУ МЕССАДЖЕЙ
-MESSAGES_PATH = r"C:\Users\Vlada\Desktop\llm_attaks\graph\data\messages.json"
+USE_BLUE = False          # True -> подключить реального синего (медленно, нужны ключи)
+SHOW_PLOTS = True         # показать графики интерактивно (на сервере поставьте False)
+
+# ---- пороги «заражения»/эпидемии ----
+INFECTION_THRESHOLD = 0.7     # риск узла (max h полученных сообщений), выше -> «заражён»
+INFECTED_NODES_RATIO = 0.3    # доля заражённых для объявления «эпидемии»
+HARMFUL_H = 0.5               # порог h, выше которого сообщение считается вредным
 
 BASE_OUTPUT_DIR = "results_2"
 
-# Параметры для определения "заражения"
-INFECTION_THRESHOLD = 0.7        # Порог риска для заражённого узла
-INFECTED_NODES_RATIO = 0.3       # Доля заражённых узлов для объявления эпидемии
-RISK_SCORE_THRESHOLD = 0.6       # Порог высокого риска
+# служебные категории timeline, которые НЕ являются распространением контента
+_SERVICE_PREFIXES = ("detected_", "received_by_llm", "warning")
 
-# ============================================================
-# ПРОВЕРКА СУЩЕСТВОВАНИЯ ФАЙЛА
-# ============================================================
-def check_messages_file():
-    """Проверяет существование файла с сообщениями"""
-    if not os.path.exists(MESSAGES_PATH):
-        print(f"❌ Ошибка: Файл не найден: {MESSAGES_PATH}")
-        print(f"   Текущая директория: {os.getcwd()}")
-        print(f"   Проверьте правильность пути к файлу messages.json")
+
+def _is_service(cat: str) -> bool:
+    return str(cat).startswith(_SERVICE_PREFIXES)
+
+
+def _is_harmful(event: dict) -> bool:
+    if _is_service(event.get("category", "")):
         return False
-    
-    print(f"✅ Файл сообщений найден: {MESSAGES_PATH}")
-    return True
+    return float(event.get("h", 0) or 0) >= HARMFUL_H
+
+
+# ------------------------------------------------------------
+# Путь к банку сообщений: env -> рядом со скриптом -> ../data -> запасной
+# ------------------------------------------------------------
+def resolve_messages_path():
+    env = os.environ.get("MESSAGES_PATH")
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        env,
+        os.path.join(here, "messages.json"),
+        os.path.join(here, "data", "messages.json"),
+        os.path.join(os.path.dirname(here), "data", "messages.json"),
+        r"C:\Users\Vlada\Desktop\llm_attaks\graph\data\messages.json",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+MESSAGES_PATH = resolve_messages_path()
+
 
 # ============================================================
-# ФУНКЦИЯ ПРОГРЕСС-БАРА
+# СИНИЙ АГЕНТ (опционально)
 # ============================================================
-def print_progress_bar(iteration, total, prefix='', suffix='', length=50, fill='█', print_end='\r'):
-    """
-    Выводит прогресс-бар в консоль
-    """
-    percent = "{0:.1f}".format(100 * (iteration / float(total)))
-    filled_length = int(length * iteration // total)
-    bar = fill * filled_length + '░' * (length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end=print_end)
-    if iteration == total:
-        print()
-
-# ============================================================
-# ФУНКЦИЯ ЗАПУСКА ОДНОЙ СИМУЛЯЦИИ
-# ============================================================
-def run_single_simulation(red_count, run_num, G, users, node_types, blue_agent):
-    """Запускает одну симуляцию и возвращает результаты"""
-    print(f"   Запуск {run_num}/{N_RUNS} для R={red_count}...")
-    
-    results = simulate_diffusion(
-        G=G,
-        users=users,
-        node_types=node_types,
-        T_steps=T_STEPS,
-        messages_path=MESSAGES_PATH,
-        blue_agent=blue_agent,
-        use_real_llm=False
+def make_blue_agent():
+    if not USE_BLUE or N_BLUE <= 0:
+        return None
+    from blue_agent import BlueAgent
+    return BlueAgent(
+        model_type=BLUE_MODEL_TYPE,
+        model_dir=BLUE_MODEL_DIR,
+        gigachat_auth_key=GIGACHAT_AUTH_KEY,
+        gigachat_scope=GIGACHAT_SCOPE,
+        yandex_api_key=YANDEX_API_KEY,
+        yandex_folder_id=YANDEX_FOLDER_ID,
+        yandex_iam_token=YANDEX_IAM_TOKEN,
+        hf_token=HF_TOKEN,
     )
-    
-    return results
+
 
 # ============================================================
-# ФУНКЦИЯ ОЦЕНКИ "ЗАРАЖЕНИЯ"
+# АНАЛИЗ ОДНОГО ПРОГОНА
 # ============================================================
 def analyze_infection(results, node_types, red_count):
-    """
-    Анализирует уровень заражения системы
-    """
     risk_scores = results.get("risk_scores", {})
     timeline = results.get("timeline", [])
-    
-    # Определяем заражённых пользователей
-    infected_users = []
-    high_risk_users = []
-    
-    for node_id_str, risk_score in risk_scores.items():
-        node_id = int(node_id_str) if isinstance(node_id_str, str) else node_id_str
-        node_type = node_types.get(node_id, "U")
-        
-        if node_type == "U":
-            if risk_score >= INFECTION_THRESHOLD:
-                infected_users.append(node_id)
-            if risk_score >= RISK_SCORE_THRESHOLD:
-                high_risk_users.append(node_id)
-    
+
     total_users = sum(1 for t in node_types.values() if t == "U")
-    
-    # Подсчёт сообщений по категориям
-    threat_count = sum(1 for e in timeline if e.get('category') in ['threat', 'manipulative'])
-    warning_count = sum(1 for e in timeline if e.get('category') == 'warning')
-    total_messages = len(timeline)
-    
-    # Динамика распространения по шагам
-    spread_by_step = defaultdict(lambda: {'threats': 0, 'warnings': 0})
-    for event in timeline:
-        step = event.get('t', 0)
-        category = event.get('category', '')
-        if category in ['threat', 'manipulative']:
-            spread_by_step[step]['threats'] += 1
-        elif category == 'warning':
-            spread_by_step[step]['warnings'] += 1
-    
-    infection_ratio = len(infected_users) / total_users if total_users > 0 else 0
-    is_epidemic = infection_ratio >= INFECTED_NODES_RATIO
-    
+
+    def as_int(x):
+        return int(x) if isinstance(x, str) else x
+
+    # заражённые по риску (risk = max h полученных сообщений)
+    infected_users = 0
+    for nid, score in risk_scores.items():
+        nid = as_int(nid)
+        if node_types.get(nid, "U") == "U" and score >= INFECTION_THRESHOLD:
+            infected_users += 1
+
+    # охват вредным контентом: уникальные U, получившие >=1 вредное сообщение
+    harmful_reached = set()
+    harmful_activity = 0
+    generated_harmful = 0
+    for e in timeline:
+        if not _is_harmful(e):
+            continue
+        to = e.get("to")
+        if to is None:
+            generated_harmful += 1
+        elif to != -1:
+            harmful_activity += 1
+            if node_types.get(as_int(to), "U") == "U":
+                harmful_reached.add(as_int(to))
+
+    infection_ratio = infected_users / total_users if total_users else 0.0
+    harmful_reach_ratio = len(harmful_reached) / total_users if total_users else 0.0
+
+    # --- СКОРОСТЬ распространения (финальный уровень насыщается, скорость — нет) ---
+    first_reach = {}
+    for e in sorted(timeline, key=lambda x: x.get("t", 0)):
+        if not _is_harmful(e):
+            continue
+        to = e.get("to")
+        if to is not None and to != -1:
+            to_i = as_int(to)
+            if node_types.get(to_i, "U") == "U" and to_i not in first_reach:
+                first_reach[to_i] = e.get("t", 0)
+
+    def reach_at(step):
+        return sum(1 for s in first_reach.values() if s <= step) / total_users if total_users else 0.0
+
+    time_to_epidemic = next((s for s in range(T_STEPS + 1)
+                             if reach_at(s) >= INFECTED_NODES_RATIO), None)
+    early_reach_ratio = reach_at(3)
+
     return {
         "red_count": red_count,
-        "infected_users": len(infected_users),
-        "high_risk_users": len(high_risk_users),
+        "infected_users": infected_users,
         "total_users": total_users,
         "infection_ratio": infection_ratio,
-        "is_epidemic": is_epidemic,
-        "threat_messages": threat_count,
-        "warning_messages": warning_count,
-        "total_messages": total_messages,
-        "spread_by_step": dict(spread_by_step)
+        "harmful_reach_users": len(harmful_reached),
+        "harmful_reach_ratio": harmful_reach_ratio,
+        "harmful_activity": harmful_activity,
+        "generated_harmful": generated_harmful,
+        "total_messages": results.get("total_messages", 0),
+        "is_epidemic": infection_ratio >= INFECTED_NODES_RATIO,
+        "time_to_epidemic": time_to_epidemic,
+        "early_reach_ratio": early_reach_ratio,
     }
 
+
 # ============================================================
-# ОСНОВНАЯ ФУНКЦИЯ ЭКСПЕРИМЕНТА
+# ОДНА ТОЧКА ЭКСПЕРИМЕНТА (усреднение по прогонам с разными сидами)
+# ============================================================
+def run_point(n_red, blue_agent):
+    runs = []
+    for run_num in range(N_RUNS):
+        seed = BASE_SEED + run_num          # РАЗНЫЙ сид -> реальная вариативность
+        G, users, node_types = create_graph(
+            num_u=N_USERS, num_r=n_red, num_l=N_LLM, num_b=N_BLUE,
+            avg_degree=AVG_DEGREE, seed=seed, verbose=False,
+        )
+        results = simulate_diffusion(
+            G=G, users=users, node_types=node_types,
+            T_steps=T_STEPS, rp=RepostParams(), seed=seed,
+            messages_path=MESSAGES_PATH, blue_agent=blue_agent,
+            # L-узлы генерируют выбранной LLM (как в run.py)
+            llm_model_type=LLM_MODEL_TYPE,
+            gigachat_auth_key=GIGACHAT_AUTH_KEY,
+            gigachat_scope=GIGACHAT_SCOPE,
+            yandex_api_key=YANDEX_API_KEY,
+            yandex_folder_id=YANDEX_FOLDER_ID,
+            yandex_iam_token=YANDEX_IAM_TOKEN,
+            hf_token=HF_TOKEN,
+            defense_policy=None,     # наблюдение без блокировки (для этого эксперимента)
+            verbose=False,           # тихий режим — не спамить консоль на свипе
+        )
+        runs.append(analyze_infection(results, node_types, n_red))
+    return runs
+
+
+def aggregate(n_red, runs):
+    def col(k):
+        return [r[k] for r in runs if r.get(k) is not None]
+    inf = col("infection_ratio")
+    reach = col("harmful_reach_ratio")
+    act = col("harmful_activity")
+    tte = [r["time_to_epidemic"] if r["time_to_epidemic"] is not None else (T_STEPS + 1)
+           for r in runs]
+    early = col("early_reach_ratio")
+    return {
+        "red_count": n_red,
+        "avg_infection_ratio": float(np.mean(inf)) if inf else 0.0,
+        "std_infection_ratio": float(np.std(inf)) if inf else 0.0,
+        "avg_infected_users": float(np.mean([r["infected_users"] for r in runs])),
+        "std_infected_users": float(np.std([r["infected_users"] for r in runs])),
+        "avg_harmful_reach_ratio": float(np.mean(reach)) if reach else 0.0,
+        "std_harmful_reach_ratio": float(np.std(reach)) if reach else 0.0,
+        "avg_harmful_activity": float(np.mean(act)) if act else 0.0,
+        "std_harmful_activity": float(np.std(act)) if act else 0.0,
+        "avg_time_to_epidemic": float(np.mean(tte)),
+        "std_time_to_epidemic": float(np.std(tte)),
+        "avg_early_reach_ratio": float(np.mean(early)) if early else 0.0,
+        "epidemic_probability": sum(1 for r in runs if r["is_epidemic"]) / len(runs),
+        "total_users": runs[0]["total_users"],
+        "runs_details": runs,
+    }
+
+
+# ============================================================
+# ГРАФИКИ
+# ============================================================
+def make_plots(all_results, out_dir):
+    plt.rcParams["font.family"] = "DejaVu Sans"   # кириллица
+    x = [r["red_count"] for r in all_results]
+    inf = [r["avg_infection_ratio"] for r in all_results]
+    inf_sd = [r["std_infection_ratio"] for r in all_results]
+    reach = [r["avg_harmful_reach_ratio"] for r in all_results]
+    act = [r["avg_harmful_activity"] for r in all_results]
+    act_sd = [r["std_harmful_activity"] for r in all_results]
+    epi = [r["epidemic_probability"] for r in all_results]
+
+    fig, ax = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Распространение вредного контента vs число красных узлов",
+                 fontsize=16, fontweight="bold")
+
+    a = ax[0, 0]
+    a.errorbar(x, inf, yerr=inf_sd, fmt="ro-", capsize=4, linewidth=2, label="Доля заражённых")
+    a.plot(x, reach, "b^--", linewidth=1.5, alpha=0.8, label="Охват вредным контентом")
+    a.axhline(INFECTED_NODES_RATIO, color="r", ls="--", alpha=0.6,
+              label=f"Порог эпидемии ({int(INFECTED_NODES_RATIO*100)}%)")
+    a.set_xlabel("Красных узлов"); a.set_ylabel("Доля пользователей")
+    a.set_title("Заражение и охват"); a.legend(); a.grid(True, alpha=0.3)
+
+    a = ax[0, 1]
+    a.errorbar(x, act, yerr=act_sd, fmt="r^-", capsize=4, linewidth=2, label="Доставки вредного")
+    a.set_xlabel("Красных узлов"); a.set_ylabel("Событий")
+    a.set_title("Активность вредного контента"); a.legend(); a.grid(True, alpha=0.3)
+
+    a = ax[1, 0]
+    a.plot(x, epi, "gs-", linewidth=2, label="Вероятность эпидемии")
+    a.fill_between(x, 0, epi, alpha=0.3, color="green")
+    a.set_xlabel("Красных узлов"); a.set_ylabel("Вероятность")
+    a.set_title("Риск эпидемии"); a.set_ylim(-0.02, 1.05); a.legend(); a.grid(True, alpha=0.3)
+
+    a = ax[1, 1]
+    tte = [r["avg_time_to_epidemic"] for r in all_results]
+    tte_sd = [r["std_time_to_epidemic"] for r in all_results]
+    a.errorbar(x, tte, yerr=tte_sd, fmt="mo-", capsize=4, linewidth=2,
+               label="Шагов до эпидемии")
+    a.set_xlabel("Красных узлов"); a.set_ylabel("Шаги до порога")
+    a.set_title("Скорость заражения (меньше = быстрее)")
+    a.legend(); a.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "infection_analysis.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"📈 График: {path}")
+    if SHOW_PLOTS:
+        try:
+            plt.show()
+        except Exception:
+            pass
+    plt.close(fig)
+
+
+# ============================================================
+# ЭКСПЕРИМЕНТ
 # ============================================================
 def run_experiment():
     print("=" * 60)
-    print("🔬 ЗАПУСК ЭКСПЕРИМЕНТА: АНАЛИЗ ЗАВИСИМОСТИ ОТ КРАСНЫХ УЗЛОВ")
+    print("🔬 ЭКСПЕРИМЕНТ: распространение vs число красных узлов")
     print("=" * 60)
-    
-    # Проверяем наличие файла с сообщениями
-    if not check_messages_file():
-        return
-    
-    # Создаём директорию для результатов
-    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+
+    if not MESSAGES_PATH:
+        print("❌ Файл messages.json не найден. Задайте путь через переменную "
+              "окружения MESSAGES_PATH или положите файл рядом со скриптом.")
+        return None
+    print(f"✅ Банк сообщений: {MESSAGES_PATH}")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = os.path.join(BASE_OUTPUT_DIR, f"experiment_{timestamp}")
-    os.makedirs(experiment_dir, exist_ok=True)
-    
-    print(f"📁 Результаты будут сохранены в: {experiment_dir}")
-    print(f"👥 Параметры: {N_USERS} пользователей, {N_BLUE} синих, {N_LLM} LLM")
-    print(f"🎯 Порог эпидемии: {INFECTED_NODES_RATIO*100}% заражённых пользователей")
-    print(f"📊 Количество экспериментов: {len(N_RED_VALUES)}")
-    print("=" * 60)
-    
+    out_dir = os.path.join(BASE_OUTPUT_DIR, f"experiment_{timestamp}")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"📁 Результаты: {out_dir}")
+    print(f"👥 {N_USERS} U, {N_LLM} L (LLM={LLM_MODEL_TYPE}), "
+          f"синий={'ON' if USE_BLUE else 'OFF'} | прогонов: {N_RUNS} | точек: {len(N_RED_VALUES)}")
+    if N_LLM > 0:
+        print("⚠️ L-узлы вызывают реальную LLM — прогон медленнее из-за сетевых запросов.")
+
+    blue_agent = make_blue_agent()   # один на весь свип (если включён)
+
     all_results = []
-    
-    # Основной цикл по количеству красных узлов
     for idx, n_red in enumerate(N_RED_VALUES, 1):
-        print(f"\n{'='*50}")
-        print(f"📊 Эксперимент {idx}/{len(N_RED_VALUES)}: Красных узлов = {n_red}")
-        print(f"{'='*50}")
-        
-        # Создаём граф для этого количества красных узлов
-        print(f"🔧 Создание графа...")
-        G, users, node_types = create_graph(
-            num_u=N_USERS,
-            num_r=n_red,
-            num_l=N_LLM,
-            num_b=N_BLUE,
-            avg_degree=AVG_DEGREE
-        )
-        
-        print(f"   Узлов: {G.number_of_nodes()}, Рёбер: {G.number_of_edges()}")
-        
-        # Создаём Blue Agent
-        blue_agent = BlueAgent() if N_BLUE > 0 else None
-        
-        # Запускаем несколько симуляций для усреднения
-        runs_results = []
-        
-        for run_num in range(1, N_RUNS + 1):
-            print(f"   Запуск {run_num}/{N_RUNS}...", end=" ", flush=True)
-            
-            results = simulate_diffusion(
-                G=G,
-                users=users,
-                node_types=node_types,
-                T_steps=T_STEPS,
-                messages_path=MESSAGES_PATH,
-                blue_agent=blue_agent,
-                use_real_llm=False
-            )
-            
-            # Анализируем результаты
-            metrics = analyze_infection(results, node_types, n_red)
-            runs_results.append(metrics)
-            
-            print(f"готово (заражено: {metrics['infected_users']}/{metrics['total_users']})")
-            
-            # Прогресс-бар для запусков
-            print_progress_bar(run_num, N_RUNS, prefix=f'   Прогресс:', suffix='', length=30)
-        
-        # Усредняем результаты по запускам
-        avg_metrics = {
-            "red_count": n_red,
-            "avg_infected_users": np.mean([r["infected_users"] for r in runs_results]),
-            "std_infected_users": np.std([r["infected_users"] for r in runs_results]),
-            "avg_infection_ratio": np.mean([r["infection_ratio"] for r in runs_results]),
-            "std_infection_ratio": np.std([r["infection_ratio"] for r in runs_results]),
-            "avg_threat_messages": np.mean([r["threat_messages"] for r in runs_results]),
-            "std_threat_messages": np.std([r["threat_messages"] for r in runs_results]),
-            "avg_warning_messages": np.mean([r["warning_messages"] for r in runs_results]),
-            "epidemic_probability": sum(1 for r in runs_results if r["is_epidemic"]) / N_RUNS,
-            "total_users": runs_results[0]["total_users"],
-            "runs_details": runs_results
-        }
-        
-        all_results.append(avg_metrics)
-        
-        # Сохраняем результаты для этого значения красных узлов
-        sim_dir = os.path.join(experiment_dir, f"red_{n_red}")
+        print(f"\n[{idx}/{len(N_RED_VALUES)}] R = {n_red} ...", end=" ", flush=True)
+        try:
+            runs = run_point(n_red, blue_agent)
+        except Exception as e:
+            print(f"ОШИБКА: {e}")
+            continue
+        agg = aggregate(n_red, runs)
+        all_results.append(agg)
+        print(f"заражено {agg['avg_infection_ratio']*100:4.1f}% "
+              f"(±{agg['std_infection_ratio']*100:.1f}) | "
+              f"шагов до эпидемии={agg['avg_time_to_epidemic']:.1f} | "
+              f"P(эпидемия)={agg['epidemic_probability']*100:.0f}%")
+
+        sim_dir = os.path.join(out_dir, f"red_{n_red}")
         os.makedirs(sim_dir, exist_ok=True)
-        
         with open(os.path.join(sim_dir, "avg_results.json"), "w", encoding="utf-8") as f:
-            json.dump(avg_metrics, f, ensure_ascii=False, indent=2)
-        
-        # Выводим краткую статистику
-        print(f"\n   📊 Результаты для R={n_red}:")
-        print(f"      Заражено: {avg_metrics['avg_infected_users']:.1f} ± {avg_metrics['std_infected_users']:.1f} пользователей")
-        print(f"      Доля заражения: {avg_metrics['avg_infection_ratio']*100:.1f}%")
-        print(f"      Вероятность эпидемии: {avg_metrics['epidemic_probability']*100:.1f}%")
-        print(f"      Угроз: {avg_metrics['avg_threat_messages']:.1f} ± {avg_metrics['std_threat_messages']:.1f}")
-    
-    # ============================================================
-    # СОЗДАНИЕ ГРАФИКОВ
-    # ============================================================
-    print("\n" + "=" * 60)
-    print("📈 СОЗДАНИЕ ГРАФИКОВ")
-    print("=" * 60)
-    
-    # Подготовка данных для графиков
-    red_counts = [r["red_count"] for r in all_results]
-    infection_ratios = [r["avg_infection_ratio"] for r in all_results]
-    infection_stds = [r["std_infection_ratio"] for r in all_results]
-    threat_counts = [r["avg_threat_messages"] for r in all_results]
-    threat_stds = [r["std_threat_messages"] for r in all_results]
-    epidemic_probs = [r["epidemic_probability"] for r in all_results]
-    
-    # График 1: Заражение с ошибками
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Анализ распространения угроз в зависимости от количества красных узлов', 
-                 fontsize=16, fontweight='bold')
-    
-    # График доли заражённых
-    ax1 = axes[0, 0]
-    ax1.errorbar(red_counts, infection_ratios, yerr=infection_stds, 
-                 fmt='ro-', capsize=5, capthick=2, elinewidth=2, 
-                 markersize=8, linewidth=2, label='Доля заражённых')
-    ax1.axhline(y=INFECTED_NODES_RATIO, color='r', linestyle='--', 
-                alpha=0.7, label=f'Порог эпидемии ({INFECTED_NODES_RATIO*100}%)')
-    ax1.set_xlabel('Количество красных узлов', fontsize=12)
-    ax1.set_ylabel('Доля заражённых пользователей', fontsize=12)
-    ax1.set_title('Заражение системы', fontsize=12, fontweight='bold')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # График количества сообщений
-    ax2 = axes[0, 1]
-    ax2.errorbar(red_counts, threat_counts, yerr=threat_stds, 
-                 fmt='r^-', capsize=5, capthick=2, elinewidth=2,
-                 markersize=8, linewidth=2, label='Угрозы')
-    ax2.set_xlabel('Количество красных узлов', fontsize=12)
-    ax2.set_ylabel('Количество сообщений', fontsize=12)
-    ax2.set_title('Активность в системе', fontsize=12, fontweight='bold')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # График вероятности эпидемии
-    ax3 = axes[1, 0]
-    ax3.plot(red_counts, epidemic_probs, 'gs-', linewidth=2, markersize=8, label='Вероятность эпидемии')
-    ax3.fill_between(red_counts, 0, epidemic_probs, alpha=0.3, color='green')
-    ax3.set_xlabel('Количество красных узлов', fontsize=12)
-    ax3.set_ylabel('Вероятность эпидемии', fontsize=12)
-    ax3.set_title('Риск эпидемии', fontsize=12, fontweight='bold')
-    ax3.set_ylim([0, 1.05])
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # Корреляционный график
-    ax4 = axes[1, 1]
-    ax4.scatter(red_counts, infection_ratios, s=100, alpha=0.7, 
-                c=red_counts, cmap='viridis', edgecolors='black')
-    # Полиномиальная аппроксимация
-    z = np.polyfit(red_counts, infection_ratios, 2)
-    p = np.poly1d(z)
-    ax4.plot(red_counts, p(red_counts), "b--", alpha=0.8, 
-             label=f'Аппроксимация (R²={np.corrcoef(red_counts, infection_ratios)[0,1]**2:.3f})')
-    ax4.set_xlabel('Количество красных узлов', fontsize=12)
-    ax4.set_ylabel('Доля заражённых', fontsize=12)
-    ax4.set_title('Корреляционный анализ', fontsize=12, fontweight='bold')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(experiment_dir, 'infection_analysis.png'), dpi=150, bbox_inches='tight')
-    plt.show()
-    
-    # ============================================================
-    # СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
-    # ============================================================
-    print("\n" + "=" * 60)
-    print("💾 СОХРАНЕНИЕ РЕЗУЛЬТАТОВ")
-    print("=" * 60)
-    
-    # Создаём сводную таблицу
-    summary = []
-    for r in all_results:
-        summary.append({
-            "red_nodes": r["red_count"],
-            "avg_infected": r["avg_infected_users"],
-            "std_infected": r["std_infected_users"],
-            "infection_ratio": r["avg_infection_ratio"],
-            "std_infection_ratio": r["std_infection_ratio"],
-            "epidemic_probability": r["epidemic_probability"],
-            "avg_threats": r["avg_threat_messages"],
-            "avg_warnings": r["avg_warning_messages"]
-        })
-    
-    # Сохраняем в JSON
-    with open(os.path.join(experiment_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(agg, f, ensure_ascii=False, indent=2)
+
+    if not all_results:
+        print("❌ Нет успешных точек эксперимента.")
+        return None
+
+    # ---- сохранение сводки ----
+    summary = [{
+        "red_nodes": r["red_count"],
+        "avg_infection_ratio": r["avg_infection_ratio"],
+        "std_infection_ratio": r["std_infection_ratio"],
+        "avg_harmful_reach_ratio": r["avg_harmful_reach_ratio"],
+        "avg_harmful_activity": r["avg_harmful_activity"],
+        "avg_time_to_epidemic": r["avg_time_to_epidemic"],
+        "avg_early_reach_ratio": r["avg_early_reach_ratio"],
+        "epidemic_probability": r["epidemic_probability"],
+    } for r in all_results]
+
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    
-    # Сохраняем в CSV
-    import csv
-    with open(os.path.join(experiment_dir, "summary.csv"), "w", newline='', encoding="utf-8") as f:
-        if summary:
-            writer = csv.DictWriter(f, fieldnames=summary[0].keys())
-            writer.writeheader()
-            writer.writerows(summary)
-    
-    # Сохраняем мета-информацию
-    meta = {
-        "timestamp": timestamp,
-        "config": {
-            "n_users": N_USERS,
-            "n_red_values": N_RED_VALUES,
-            "n_llm": N_LLM,
-            "n_blue": N_BLUE,
-            "avg_degree": AVG_DEGREE,
-            "t_steps": T_STEPS,
-            "n_runs": N_RUNS,
-            "infection_threshold": INFECTION_THRESHOLD,
-            "epidemic_ratio": INFECTED_NODES_RATIO
-        },
-        "messages_path": MESSAGES_PATH
-    }
-    
-    with open(os.path.join(experiment_dir, "meta.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "summary.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+        w.writeheader(); w.writerows(summary)
+
+    meta = {"timestamp": timestamp, "messages_path": MESSAGES_PATH,
+            "config": {"n_users": N_USERS, "n_red_values": N_RED_VALUES,
+                       "n_llm": N_LLM, "n_blue": N_BLUE, "avg_degree": AVG_DEGREE,
+                       "t_steps": T_STEPS, "n_runs": N_RUNS, "use_blue": USE_BLUE,
+                       "llm_model_type": LLM_MODEL_TYPE,
+                       "infection_threshold": INFECTION_THRESHOLD,
+                       "epidemic_ratio": INFECTED_NODES_RATIO}}
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    
-    # Определяем критический порог
+
+    # ---- порог эпидемии ----
     print("\n" + "=" * 60)
-    print("🎯 ОПРЕДЕЛЕНИЕ ПОРОГА ЭПИДЕМИИ")
+    print("🎯 ПОРОГ ЭПИДЕМИИ")
     print("=" * 60)
-    
-    epidemic_threshold = None
-    for r in all_results:
-        if r["epidemic_probability"] >= 0.5:
-            epidemic_threshold = r["red_count"]
-            break
-    
-    if epidemic_threshold:
-        print(f"⚠️ Критический порог (50% вероятность эпидемии): {epidemic_threshold} красных узлов")
-        
-        # Находим безопасный максимум
-        safe_max = None
-        for r in all_results:
-            if r["red_count"] < epidemic_threshold and r["epidemic_probability"] < 0.1:
-                safe_max = r["red_count"]
-        
-        if safe_max:
-            print(f"   Безопасный максимум (вероятность <10%): {safe_max} красных узлов")
-            print(f"   Окно уязвимости: {safe_max + 1} - {epidemic_threshold}")
+    threshold = next((r["red_count"] for r in all_results
+                      if r["epidemic_probability"] >= 0.5), None)
+    if threshold is not None:
+        safe = [r["red_count"] for r in all_results
+                if r["red_count"] < threshold and r["epidemic_probability"] < 0.1]
+        print(f"⚠️ Критический порог (P≥50%): {threshold} красных узлов")
+        if safe:
+            print(f"   Безопасный максимум (P<10%): {max(safe)}")
+            print(f"   Окно уязвимости: {max(safe)+1}–{threshold}")
     else:
-        print("⚠️ В исследуемом диапазоне не достигнут порог 50% вероятности эпидемии")
-    
+        print("В исследованном диапазоне порог 50% не достигнут.")
+
+    make_plots(all_results, out_dir)
+
     print("\n" + "=" * 60)
-    print("✅ ЭКСПЕРИМЕНТ ЗАВЕРШЁН УСПЕШНО!")
+    print("✅ ГОТОВО")
+    print(f"📊 Сводка: {os.path.join(out_dir, 'summary.csv')}")
     print("=" * 60)
-    print(f"📁 Результаты сохранены в: {experiment_dir}")
-    print(f"📊 Сводная таблица: {os.path.join(experiment_dir, 'summary.csv')}")
-    print(f"📈 Графики: {os.path.join(experiment_dir, 'infection_analysis.png')}")
-    
     return all_results
 
-# ============================================================
-# ЗАПУСК
-# ============================================================
+
 if __name__ == "__main__":
     try:
-        results = run_experiment()
+        run_experiment()
     except Exception as e:
-        print(f"\n❌ Ошибка при выполнении эксперимента: {e}")
+        print(f"\n❌ Ошибка эксперимента: {e}")
         import traceback
         traceback.print_exc()
-        input("\nНажмите Enter для выхода...")

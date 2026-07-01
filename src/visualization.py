@@ -1,4 +1,4 @@
-# visualization.py – полностью исправленная версия
+# visualization.py – исправленная версия с подсветкой опасных рёбер
 from pyvis.network import Network
 import json
 from collections import defaultdict
@@ -40,7 +40,8 @@ def visualize_graph(G, results, users, node_types=None, blue_agent=None, output_
                 "text": event.get("text", ""),
                 "category": event.get("category", "unknown"),
                 "h": event.get("h", 0),
-                "risk_score": event.get("detected_risk", event.get("blue_risk_score", 0)),
+                "risk_score": (event.get("detected_risk") if event.get("detected_risk") is not None
+                               else event.get("blue_risk_score", 0)) or 0,
                 "risk_level": event.get("detected_category", event.get("blue_risk_level", "UNKNOWN"))
             })
 
@@ -241,7 +242,8 @@ def visualize_graph(G, results, users, node_types=None, blue_agent=None, output_
 
     html = net.generate_html()
 
-    custom_js = f"""
+    # ----- custom_js – обычная строка (не f-строка) -----
+    custom_js = """
 <script>
 let timelineData = {timeline_json};
 let edgeMap = {edge_map_json};
@@ -256,10 +258,11 @@ let currentTime = 0;
 let animInterval = null;
 let settingsVisible = false;
 
-function showFullInfoNode(nodeId) {{
+
+function showFullInfoNode(nodeId) {
     let modal = document.getElementById("nodeModal");
     let content = document.getElementById("nodeModalContent");
-    if (!modal) {{
+    if (!modal) {
         let modalHtml = `
         <div id="nodeModal" style="display:none; position:fixed; z-index:10000; left:0; top:0;
              width:100%; height:100%; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px);">
@@ -268,7 +271,7 @@ function showFullInfoNode(nodeId) {{
                  box-shadow:0 5px 20px rgba(0,0,0,0.3); display:flex; flex-direction:column;">
                 <div style="padding:10px 15px; border-bottom:1px solid #eee; display:flex; 
                      justify-content:space-between; align-items:center;">
-                    <h3 style="margin:0; font-size:16px;">🔷 NODE ${{nodeId}}</h3>
+                    <h3 style="margin:0; font-size:16px;">🔷 NODE ${nodeId}</h3>
                     <button onclick="closeModal('nodeModal')" style="background:none; border:none; font-size:22px; cursor:pointer;">&times;</button>
                 </div>
                 <div id="nodeModalContent" style="padding:12px; overflow-y:auto; flex:1; font-family:monospace; font-size:11px;"></div>
@@ -277,67 +280,141 @@ function showFullInfoNode(nodeId) {{
         document.body.insertAdjacentHTML('beforeend', modalHtml);
         modal = document.getElementById("nodeModal");
         content = document.getElementById("nodeModalContent");
-    }}
+    }
 
     let nodeType = nodeTypes[String(nodeId)] || "U";
     let html = "";
+    let nodeStr = String(nodeId);
 
-    if (nodeType === "B") {{
-        let received = nodeReceivedMessages[String(nodeId)] || [];
-        html = `<h4 style="margin:0 0 8px 0;">🔷 BLUE MODERATOR - Полученные сообщения</h4>`;
-        if (received.length === 0) {{
+    // --- LLM AGENT: показываем и полученные, и сгенерированные ---
+    if (nodeType === "L") {
+        let received = nodeReceivedMessages[nodeStr] || [];
+        let sent = nodeSentMessages[nodeStr] || [];
+
+        // Полученные сообщения (серый фон, опасные – красный)
+        html += `<h4 style="margin:0 0 8px 0; background:#e0e0e0; padding:4px 8px;">📥 ПОЛУЧЕННЫЕ СООБЩЕНИЯ (серый)</h4>`;
+        if (received.length === 0) {
             html += "<p>Нет полученных сообщений</p>";
-        }} else {{
-            html += `<table style="width:100%; border-collapse:collapse; font-size:10px;">
+        } else {
+            html += `<table style="width:100%; border-collapse:collapse; font-size:10px; background:#f5f5f5;">
                         <thead>
-                            <tr style="background:#f0f0f0; border-bottom:1px solid #ccc;">
-                                <th style="padding:3px;">t</th><th style="padding:3px;">От</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th><th style="padding:3px;">Blue Risk</th><th style="padding:3px;">Уровень</th>
+                            <tr style="background:#d0d0d0; border-bottom:1px solid #ccc;">
+                                <th style="padding:3px;">t</th><th style="padding:3px;">От</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th><th style="padding:3px;">⚠️</th>
                             </tr>
                         </thead>
                         <tbody>`;
-            for (let msg of received) {{
-                html += `<tr style="border-bottom:1px solid #ddd;">
-                            <td style="padding:3px;">${{msg.t}}</td>
-                            <td style="padding:3px;">${{msg.from}}</td>
-                            <td style="padding:3px;">${{msg.text.substring(0, 50)}}</td>
-                            <td style="padding:3px;">${{msg.category}}</td>
-                            <td style="padding:3px;">${{msg.h.toFixed(2)}}</td>
-                            <td style="padding:3px;">${{msg.risk_score.toFixed(2)}}</td>
-                            <td style="padding:3px;">${{msg.risk_level}}</td>
+            for (let msg of received) {
+                let isDanger = (msg.h > 0.5 || msg.category === "threat" || msg.category === "manipulative" || msg.category === "toxic");
+                let rowStyle = isDanger ? 'style="background:#ffcccc;"' : '';
+                let dangerMark = isDanger ? '⚠️' : '';
+                html += `<tr ${rowStyle} style="border-bottom:1px solid #ddd;">
+                            <td style="padding:3px;">${msg.t}</td>
+                            <td style="padding:3px;">${msg.from}</td>
+                            <td style="padding:3px;">${msg.text.substring(0, 50)}</td>
+                            <td style="padding:3px;">${msg.category}</td>
+                            <td style="padding:3px;">${msg.h.toFixed(2)}</td>
+                            <td style="padding:3px;">${dangerMark}</td>
                           </tr>`;
-            }}
-            html += `</tbody>`;
-        }}
-    }} else if (nodeType === "L" || nodeType === "R") {{
-        let sent = nodeSentMessages[String(nodeId)] || [];
-        let title = (nodeType === "L") ? "🟡 LLM AGENT - Сгенерированные сообщения" : "🔴 RED AGENT - Сгенерированные сообщения";
-        html = `<h4 style="margin:0 0 8px 0;">${{title}}</h4>`;
-        if (sent.length === 0) {{
+            }
+            html += `</tbody></table>`;
+        }
+
+        // Сгенерированные сообщения (жёлтый фон, опасные – красный)
+        html += `<h4 style="margin:12px 0 8px 0; background:#f1c40f; padding:4px 8px;">📤 СГЕНЕРИРОВАННЫЕ СООБЩЕНИЯ (жёлтый)</h4>`;
+        if (sent.length === 0) {
             html += "<p>Нет сгенерированных сообщений</p>";
-        }} else {{
-            html += `<table style="width:100%; border-collapse:collapse; font-size:10px;">
+        } else {
+            html += `<table style="width:100%; border-collapse:collapse; font-size:10px; background:#fff9e6;">
                         <thead>
-                            <tr style="background:#f0f0f0; border-bottom:1px solid #ccc;">
-                                <th style="padding:3px;">t</th><th style="padding:3px;">Кому</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th>
+                            <tr style="background:#f0d080; border-bottom:1px solid #ccc;">
+                                <th style="padding:3px;">t</th><th style="padding:3px;">Кому</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th><th style="padding:3px;">⚠️</th>
                             </tr>
                         </thead>
                         <tbody>`;
-            for (let msg of sent) {{
-                html += `<tr style="border-bottom:1px solid #ddd;">
-                            <td style="padding:3px;">${{msg.t}}</td>
+            for (let msg of sent) {
+                let isDanger = (msg.h > 0.5 || msg.category === "threat" || msg.category === "manipulative" || msg.category === "toxic");
+                let rowStyle = isDanger ? 'style="background:#ffcccc;"' : '';
+                let dangerMark = isDanger ? '⚠️' : '';
+                html += `<tr ${rowStyle} style="border-bottom:1px solid #ddd;">
+                            <td style="padding:3px;">${msg.t}</td>
                             <td style="padding:3px;">Новый</td>
-                            <td style="padding:3px;">${{msg.text.substring(0, 50)}}</td>
-                            <td style="padding:3px;">${{msg.category}}</td>
-                            <td style="padding:3px;">${{msg.h.toFixed(2)}}</td>
+                            <td style="padding:3px;">${msg.text.substring(0, 50)}</td>
+                            <td style="padding:3px;">${msg.category}</td>
+                            <td style="padding:3px;">${msg.h.toFixed(2)}</td>
+                            <td style="padding:3px;">${dangerMark}</td>
                           </tr>`;
-            }}
-            html += `</tbody>`;
-        }}
-    }} else {{
-        let states = nodeStatesHistory[String(nodeId)];
-        if (!states || states.length === 0) {{
+            }
+            html += `</tbody></table>`;
+        }
+    }
+    // --- RED AGENT: только сгенерированные (с красным выделением) ---
+    else if (nodeType === "R") {
+        let sent = nodeSentMessages[nodeStr] || [];
+        html = `<h4 style="margin:0 0 8px 0;">🔴 RED AGENT - Сгенерированные сообщения</h4>`;
+        if (sent.length === 0) {
+            html += "<p>Нет сгенерированных сообщений</p>";
+        } else {
+            html += `<table style="width:100%; border-collapse:collapse; font-size:10px;">
+                        <thead>
+                            <tr style="background:#f0f0f0; border-bottom:1px solid #ccc;">
+                                <th style="padding:3px;">t</th><th style="padding:3px;">Кому</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th><th style="padding:3px;">⚠️</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+            for (let msg of sent) {
+                let isDanger = (msg.h > 0.5 || msg.category === "threat" || msg.category === "manipulative" || msg.category === "toxic");
+                let rowStyle = isDanger ? 'style="background:#ffcccc;"' : '';
+                let dangerMark = isDanger ? '⚠️' : '';
+                html += `<tr ${rowStyle} style="border-bottom:1px solid #ddd;">
+                            <td style="padding:3px;">${msg.t}</td>
+                            <td style="padding:3px;">Новый</td>
+                            <td style="padding:3px;">${msg.text.substring(0, 50)}</td>
+                            <td style="padding:3px;">${msg.category}</td>
+                            <td style="padding:3px;">${msg.h.toFixed(2)}</td>
+                            <td style="padding:3px;">${dangerMark}</td>
+                          </tr>`;
+            }
+            html += `</tbody></table>`;
+        }
+    }
+    // --- BLUE MODERATOR: полученные с рисками (с красным выделением) ---
+    else if (nodeType === "B") {
+        let received = nodeReceivedMessages[nodeStr] || [];
+        html = `<h4 style="margin:0 0 8px 0;">🔷 BLUE MODERATOR - Полученные сообщения</h4>`;
+        if (received.length === 0) {
+            html += "<p>Нет полученных сообщений</p>";
+        } else {
+            html += `<table style="width:100%; border-collapse:collapse; font-size:10px;">
+                        <thead>
+                            <tr style="background:#f0f0f0; border-bottom:1px solid #ccc;">
+                                <th style="padding:3px;">t</th><th style="padding:3px;">От</th><th style="padding:3px;">Текст</th><th style="padding:3px;">Кат.</th><th style="padding:3px;">h</th><th style="padding:3px;">Blue Risk</th><th style="padding:3px;">Уровень</th><th style="padding:3px;">⚠️</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+            for (let msg of received) {
+                let isDanger = (msg.h > 0.5 || msg.category === "threat" || msg.category === "manipulative" || msg.category === "toxic");
+                let rowStyle = isDanger ? 'style="background:#ffcccc;"' : '';
+                let dangerMark = isDanger ? '⚠️' : '';
+                html += `<tr ${rowStyle} style="border-bottom:1px solid #ddd;">
+                            <td style="padding:3px;">${msg.t}</td>
+                            <td style="padding:3px;">${msg.from}</td>
+                            <td style="padding:3px;">${msg.text.substring(0, 50)}</td>
+                            <td style="padding:3px;">${msg.category}</td>
+                            <td style="padding:3px;">${msg.h.toFixed(2)}</td>
+                            <td style="padding:3px;">${msg.risk_score.toFixed(2)}</td>
+                            <td style="padding:3px;">${msg.risk_level}</td>
+                            <td style="padding:3px;">${dangerMark}</td>
+                          </tr>`;
+            }
+            html += `</tbody></table>`;
+        }
+    }
+    // --- Обычный пользователь: история состояний (без изменений) ---
+    else {
+        let states = nodeStatesHistory[nodeStr];
+        if (!states || states.length === 0) {
             html = "<i>Нет истории состояний для этого узла</i>";
-        }} else {{
+        } else {
             html = `<h4 style="margin:0 0 8px 0;">📈 UserState History (b, c, e)</h4>`;
             html += `<table style="width:100%; border-collapse:collapse; text-align:center; font-size:10px;">
                         <thead>
@@ -346,26 +423,27 @@ function showFullInfoNode(nodeId) {{
                             </tr>
                         </thead>
                         <tbody>`;
-            for (let s of states) {{
+            for (let s of states) {
                 html += `<tr style="border-bottom:1px solid #ddd;">
-                            <td style="padding:3px;">${{s.t}}</td>
-                            <td style="padding:3px;">${{Number(s.b).toFixed(4)}}</td>
-                            <td style="padding:3px;">${{Number(s.c).toFixed(4)}}</td>
-                            <td style="padding:3px;">${{Number(s.e).toFixed(4)}}</td>
+                            <td style="padding:3px;">${s.t}</td>
+                            <td style="padding:3px;">${Number(s.b).toFixed(4)}</td>
+                            <td style="padding:3px;">${Number(s.c).toFixed(4)}</td>
+                            <td style="padding:3px;">${Number(s.e).toFixed(4)}</td>
                           </tr>`;
-            }}
-            html += `</tbody>`;
-        }}
-    }}
+            }
+            html += `</tbody></table>`;
+        }
+    }
+
     content.innerHTML = html;
     modal.style.display = "block";
-}}
+}
 
-function showFullInfoEdge(edgeId) {{
+function showFullInfoEdge(edgeId) {
     let info = edgeFullInfo[edgeId];
     let modal = document.getElementById("edgeModal");
     let content = document.getElementById("edgeModalContent");
-    if (!modal) {{
+    if (!modal) {
         let modalHtml = `
         <div id="edgeModal" style="display:none; position:fixed; z-index:10000; left:0; top:0;
              width:100%; height:100%; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px);">
@@ -383,141 +461,143 @@ function showFullInfoEdge(edgeId) {{
         document.body.insertAdjacentHTML('beforeend', modalHtml);
         modal = document.getElementById("edgeModal");
         content = document.getElementById("edgeModalContent");
-    }}
-    if (info && info.messages.length) {{
-        content.innerHTML = `<b>🔷 EDGE ${{info.u}} → ${{info.v}}</b><br><hr>
-            <b>📊 Всего сообщений:</b> ${{info.total}}<br><br>
-            <div style="max-height:400px; overflow-y:auto;">${{info.messages.join('')}}</div>`;
-    }} else {{
+    }
+    if (info && info.messages.length) {
+        content.innerHTML = `<b>🔷 EDGE ${info.u} → ${info.v}</b><br><hr>
+            <b>📊 Всего сообщений:</b> ${info.total}<br><br>
+            <div style="max-height:400px; overflow-y:auto;">${info.messages.join('')}</div>`;
+    } else {
         content.innerHTML = "<i>На этом ребре нет сообщений</i>";
-    }}
+    }
     modal.style.display = "block";
-}}
+}
 
-function closeModal(modalId) {{
+function closeModal(modalId) {
     let modal = document.getElementById(modalId);
     if(modal) modal.style.display = "none";
-}}
+}
 
-function updateEdgeTooltip(edgeId, time) {{
+function updateEdgeTooltip(edgeId, time) {
     let edges = network.body.data.edges;
     let edge = edges.get(edgeId);
     if(!edge) return;
-    let msgs = (edgeMessagesByTime[edgeId] || {{}})[time] || [];
+    let msgs = (edgeMessagesByTime[edgeId] || {})[time] || [];
     let lines = ["━━━━━━━━━━━━━━━━━━━━━━", "EDGE " + edge.from + " → " + edge.to, "⏰ ВРЕМЯ: " + time];
-    if(msgs.length) {{
+    if(msgs.length) {
         lines.push("📨 СООБЩЕНИЙ: " + msgs.length);
-        for(let i=0;i<msgs.length;i++){{
+        for(let i=0;i<msgs.length;i++){
             lines.push("────────────────────");
             lines.push("📝: " + msgs[i].text.substring(0,50));
             lines.push("🏷️: " + msgs[i].category);
             lines.push("📊 h: " + msgs[i].h);
             if(msgs[i].age) lines.push("⏰ Age: " + msgs[i].age);
             lines.push("🤖 Blue Risk: " + msgs[i].blue_risk_score + " (" + msgs[i].blue_risk_level + ")");
-        }}
-    }} else {{
+        }
+    } else {
         lines.push("📭 Нет сообщений");
-    }}
+    }
     lines.push("━━━━━━━━━━━━━━━━━━━━━━","💡 Двойной клик → полная информация");
-    edges.update({{ id: edgeId, title: lines.join("\\n") }});
-}}
+    edges.update({ id: edgeId, title: lines.join("\\n") });
+}
 
-function updateAllTooltips(time) {{
+function updateAllTooltips(time) {
     for(let key in edgeMap) updateEdgeTooltip(edgeMap[key], time);
-}}
+}
 
-function resetAllEdges() {{
+function resetAllEdges() {
     let edges = network.body.data.edges;
     let all = edges.get();
-    for(let e of all) edges.update({{ id: e.id, color: "#95a5a6", width: 2 }});
-}}
+    for(let e of all) edges.update({ id: e.id, color: "#95a5a6", width: 2 });
+}
 
-function highlightEdge(from, to, color) {{
+function highlightEdge(from, to, color) {
     let eid = edgeMap[from+","+to];
-    if(eid !== undefined) network.body.data.edges.update({{ id: eid, color: color, width: 4 }});
-}}
+    if(eid !== undefined) network.body.data.edges.update({ id: eid, color: color, width: 4 });
+}
 
-function updateByTime(time) {{
+function updateByTime(time) {
     resetAllEdges();
     let events = timelineData[time] || [];
-    for(let e of events){{
-        let col = (e.category==="threat"||e.category==="manipulative") ? "#e74c3c" : "#3498db";
+    for(let e of events){
+        // Опасное сообщение: категория threat/manipulative/toxic или h > 0.5
+        let isDanger = (e.category==="threat" || e.category==="manipulative" || e.category==="toxic" || e.h > 0.5);
+        let col = isDanger ? "#e74c3c" : "#3498db";
         highlightEdge(e.from, e.to, col);
-    }}
+    }
     updateAllTooltips(time);
     document.getElementById("timeLabel").innerHTML = "⏰ TIME: " + time;
     document.getElementById("timeSlider").value = time;
-}}
+}
 
-function playAnimation() {{
-    if(animInterval){{
+function playAnimation() {
+    if(animInterval){
         clearInterval(animInterval); animInterval=null;
         document.getElementById("playBtn").innerHTML = "▶ Play";
         return;
-    }}
+    }
     document.getElementById("playBtn").innerHTML = "⏸ Pause";
-    animInterval = setInterval(() => {{
-        if(currentTime >= {max_time}){{
+    animInterval = setInterval(() => {
+        if(currentTime >= {max_time}){
             clearInterval(animInterval); animInterval=null;
             document.getElementById("playBtn").innerHTML = "▶ Play";
             return;
-        }}
+        }
         currentTime++;
         updateByTime(currentTime);
-    }}, 800);
-}}
+    }, 800);
+}
 
-function resetAnimation() {{
-    if(animInterval){{ clearInterval(animInterval); animInterval=null; }}
+function resetAnimation() {
+    if(animInterval){ clearInterval(animInterval); animInterval=null; }
     currentTime=0; updateByTime(0);
     document.getElementById("playBtn").innerHTML = "▶ Play";
-}}
+}
 
-function onTimeChange(val){{
-    if(animInterval){{ clearInterval(animInterval); animInterval=null; document.getElementById("playBtn").innerHTML = "▶ Play"; }}
+function onTimeChange(val){
+    if(animInterval){ clearInterval(animInterval); animInterval=null; document.getElementById("playBtn").innerHTML = "▶ Play"; }
     currentTime = parseInt(val);
     updateByTime(currentTime);
-}}
+}
 
-function toggleSettings(){{
+function toggleSettings(){
     let panel = document.getElementById("settingsPanel");
     settingsVisible = !settingsVisible;
     panel.style.display = settingsVisible ? "block" : "none";
-}}
+}
 
-function updateNodeSize(val){{
+function updateNodeSize(val){
     let nodes = network.body.data.nodes;
     let allNodes = nodes.get();
-    for(let n of allNodes){{
-        nodes.update({{ id: n.id, size: Number(val), font: {{ size: Math.max(12, Number(val) * 0.35) }} }});
-    }}
+    for(let n of allNodes){
+        nodes.update({ id: n.id, size: Number(val), font: { size: Math.max(12, Number(val) * 0.35) } });
+    }
     network.redraw();
     document.getElementById("nodeSizeValue").innerHTML = val;
-}}
+}
 
-function updateEdgeDistance(val){{
-    network.setOptions({{ physics: {{ barnesHut: {{ springLength: parseInt(val) }} }} }});
+function updateEdgeDistance(val){
+    network.setOptions({ physics: { barnesHut: { springLength: parseInt(val) } } });
     document.getElementById("edgeDistanceValue").innerHTML = val;
-}}
+}
 
-network.once("stabilizationIterationsDone", function() {{
+network.once("stabilizationIterationsDone", function() {
     updateByTime(0);
-}});
+});
 
-network.on("doubleClick", function(params) {{
-    if (params.nodes.length > 0) {{
+network.on("doubleClick", function(params) {
+    if (params.nodes.length > 0) {
         showFullInfoNode(params.nodes[0]);
-    }} else if (params.edges.length > 0) {{
+    } else if (params.edges.length > 0) {
         showFullInfoEdge(params.edges[0]);
-    }}
-}});
+    }
+});
 
-document.addEventListener('click', function(e){{
+document.addEventListener('click', function(e){
     let em = document.getElementById('edgeModal');
     let nm = document.getElementById('nodeModal');
     if(e.target===em) em.style.display='none';
     if(e.target===nm) nm.style.display='none';
-}});
+});
 </script>
 
 <div style="position:fixed; bottom:20px; left:20px; z-index:999;">
@@ -539,15 +619,26 @@ document.addEventListener('click', function(e){{
 </div>
 
 <style>
-  .vis-tooltip {{ background: rgba(0,0,0,0.9); color: #fff; padding: 8px; border-radius: 6px; font-size: 10px; font-family: monospace; max-width: 450px; white-space: pre-line; z-index: 1000; }}
-  ::-webkit-scrollbar {{ width: 6px; }}
-  ::-webkit-scrollbar-track {{ background: #f1f1f1; border-radius: 3px; }}
-  ::-webkit-scrollbar-thumb {{ background: #888; border-radius: 3px; }}
-  table {{ font-size: 10px; }}
-  th {{ padding: 3px; }}
-  td {{ padding: 3px; }}
+  .vis-tooltip { background: rgba(0,0,0,0.9); color: #fff; padding: 8px; border-radius: 6px; font-size: 10px; font-family: monospace; max-width: 450px; white-space: pre-line; z-index: 1000; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb { background: #888; border-radius: 3px; }
+  table { font-size: 10px; }
+  th { padding: 3px; }
+  td { padding: 3px; }
 </style>
 """
+
+    # Подставляем реальные значения вместо плейсхолдеров
+    custom_js = custom_js.replace("{timeline_json}", timeline_json)
+    custom_js = custom_js.replace("{edge_map_json}", edge_map_json)
+    custom_js = custom_js.replace("{edge_full_info_json}", edge_full_info_json)
+    custom_js = custom_js.replace("{edge_messages_by_time_json}", edge_messages_by_time_json)
+    custom_js = custom_js.replace("{node_history_json}", node_history_json)
+    custom_js = custom_js.replace("{node_received_json}", node_received_json)
+    custom_js = custom_js.replace("{node_sent_json}", node_sent_json)
+    custom_js = custom_js.replace("{node_types_json}", node_types_json)
+    custom_js = custom_js.replace("{max_time}", str(max_time))
 
     html = html.replace("</body>", custom_js + "</body>")
     with open(output_path, "w", encoding="utf-8") as f:
